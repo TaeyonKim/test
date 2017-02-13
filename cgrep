@@ -1,0 +1,184 @@
+#!/bin/bash
+# Written by Taeyon Kim
+
+set -o noglob
+
+#
+# Global settings
+#
+TYPE_c=*.c,*.h
+TYPE_cpp=*.cc,*.cpp,*.h,*.hpp
+TYPE_java=*.java
+TYPE_go=*.go
+TYPE_py=*.py,*.ipynb
+TYPE_x=*.x
+TYPE_mk=*.mk,makefile,Makefile,GNUmakefile
+TYPE_all=*
+TYPE_oily=*.oily
+
+TYPE_ALL=c,cpp,java,go,py,x,mk,oily
+
+DEFAULT_TYPES=c,cpp,x,go,java,oily,py
+DEFAULT_CNUM=20
+DEFAULT_AWK=awk
+DEFAULT_DIRS=.
+
+# Load user settings to overwrite defaults
+[ -f ~/.cgrep ] && . ~/.cgrep
+
+
+# 
+# @brief Print usage
+#
+usage()
+{
+    echo "`basename $0`: [-c n] [-d dir] [-t types] pattern [dirs...]"
+	echo "  pattern: a regular expression to find matches"
+	echo "  dirs...: zero or more directories to search. The default is $DEFAULT_DIRS"
+    echo "  -c <n> : print <n> lines of output context"
+    echo "  -d <dir> : specify the searching directory path"
+
+fmt -80<<EOF
+  -t <types> : search files of <types>. <types> is a list, comma-separated,
+    of $TYPE_ALL. The default is $DEFAULT_TYPES. Each type covers
+    following files:
+EOF
+	for i in `echo $TYPE_ALL | tr "," " "`; do
+		printf "    "
+		eval echo \$i=\$TYPE_$i
+	done
+}
+
+
+#
+# @brief Get file types
+# @param 1  A comma-seprated list of type names
+# @return: file types
+#
+get_file_types()
+{ (
+	IFS=,
+	for i in $1; do eval printf "%s," \$TYPE_$i; done
+) }
+
+
+#
+# @brief Convert lists of file types to find options
+# @param 1..n  Lists, comma-separated, of file types
+# @return: A find options string
+#
+get_find_name_pattern()
+{ (
+	IFS=,
+	echo "$*" | tr "," "\n" | sort -u | sed 's/\./\\./g' | awk '
+BEGIN { printf "( " }
+{
+	if ($1 != "") {
+		if (por == 1) { printf "-o " }
+		printf "-name %s ", $1
+		por = 1;
+	}
+}
+END { printf ")" }'
+) }
+
+
+#
+# Parse arguments
+#
+while getopts "c:d:ht:" opt
+do
+    case "$opt" in
+        c) cnum=$OPTARG;;
+        d) dir=$OPTARG;;
+        h) usage; exit 0;;
+        t) types=$OPTARG;;
+        \?) usage; exit 1;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+	usage
+	exit 1
+fi
+
+shift `expr $OPTIND - 1`
+keyword="$1"; shift
+searchdirs=$DEFAULT_DIRS
+[ $# -gt 0 ] && searchdirs=$@
+types=${types:-$DEFAULT_TYPES}
+cnum=${cnum:-$DEFAULT_CNUM}
+dir=${dir:-.}
+awkbin=${DEFAULT_AWK}
+
+
+#
+# Run find & grep
+#
+filetypes=`get_file_types $types`
+np=`get_find_name_pattern $filetypes`
+
+(cd $dir && find $searchdirs -type f $np -print0 | xargs -0 $awkbin \
+-v "cnum=${cnum:-0}" -v "keyword=$keyword" '
+BEGIN {
+    cq_max = cnum;
+}
+
+# Add a line to the circular queue
+function cq_add(line) {
+    if (cq_max > 0) {
+        cq[cq_idx++] = line;
+        if (cq_idx >= cq_max) {
+                cq_idx = 0;
+        }
+    }
+}
+
+# Clear the circular queue after printing the contents
+function cq_print_clear(prefix) {
+    if (cq_max > 0) {
+        if (length(cq[cq_idx]) > 0) {
+                for (i = cq_idx; i < cq_max; i++) {
+                        print "-" prefix cq[i];
+                        cq[i] = "";
+                }
+        }
+        for (i = 0; i < cq_idx; i++) {
+                print "-" prefix cq[i];
+                cq[i] = "";
+        }
+
+        cq_idx = 0;
+    }
+}
+
+# Clear the circular queue
+function cq_clear() {
+    for (i = 0; i < cq_max; i++) {
+        cq[i] = "";
+    }
+
+    cq_idx = 0;
+}
+
+# Main routine
+{
+    if (FNR == 1) {
+        cq_clear();
+		line_no = 0;
+		prefix = "";
+    }
+
+    if ($0 ~ keyword) {
+        prefix = FILENAME ":" FNR ":";
+        gsub(".", " ", prefix);
+        cq_print_clear(prefix);
+        print "=" FILENAME ":" FNR ":" $0;
+        line_no = FNR;
+    } else if (line_no != 0 && FNR >= line_no && FNR <= line_no + cnum) {
+        print "+" prefix $0;
+    } else {
+        cq_add($0);
+    }
+}'
+) | less
